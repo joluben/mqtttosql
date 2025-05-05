@@ -11,11 +11,17 @@ import time
 import json
 import re
 import datetime
+import signal
+import sys
 import psycopg
 import paho.mqtt.client as mqtt
 from shapely import wkt
 
+# Evento de parada global para terminar hilos de forma controlada
+stop_event = threading.Event()
+
 # Sanitizar nombres para uso en SQL
+
 def sanitize_name(name):
     sanitized = re.sub(r'[^0-9a-zA-Z_]', '_', str(name))
     if sanitized and sanitized[0].isdigit():
@@ -23,6 +29,7 @@ def sanitize_name(name):
     return sanitized.lower()
 
 # Inferencia de tipos SQL
+
 def is_date(value):
     try:
         datetime.datetime.strptime(value, "%Y-%m-%d")
@@ -57,10 +64,12 @@ def infer_sql_type(value):
     return "TEXT"
 
 # Construir esquema
+
 schema_registry = {}
 
 def build_schema(topic, data):
     topic_table = sanitize_name(topic)
+
     def build_node(table_name, obj, parent_table=None):
         node = {
             "table": sanitize_name(table_name),
@@ -69,21 +78,26 @@ def build_schema(topic, data):
             "nested": {}
         }
         for key, val in obj.items():
-            if isinstance(val, (dict, list)): continue
-            col = sanitize_name(key)
-            if col == "id": col = "json_id"
-            node["columns"].append(col)
-            node["types"][col] = infer_sql_type(val)
-        for key, val in obj.items():
+            if isinstance(val, list):
+                # Advertencia por ahora: no se procesan listas
+                continue
             if isinstance(val, dict):
                 sub = build_node(f"{table_name}_{key}", val, parent_table=table_name)
                 node["nested"][key] = sub
+            else:
+                col = sanitize_name(key)
+                if col == "id": col = "json_id"
+                node["columns"].append(col)
+                node["types"][col] = infer_sql_type(val)
         return node
+
     return build_node(topic_table, data)
 
 # Crear tablas
+
 def build_create_table_sql(schema_node):
     stmts = []
+
     def build(schema):
         table = schema['table']
         cols = ["id BIGSERIAL PRIMARY KEY"]
@@ -100,10 +114,12 @@ def build_create_table_sql(schema_node):
         stmts.append(sql)
         for child in schema.get("nested", {}).values():
             build(child)
+
     build(schema_node)
     return stmts
 
 # Insertar datos
+
 def build_insert_query(table, columns, types, parent_table=None):
     all_cols = list(columns)
     if parent_table:
@@ -122,7 +138,14 @@ def build_insert_query(table, columns, types, parent_table=None):
 def insert_single_row(conn, data, schema, parent_id=None):
     table = schema['table']
     cols = schema['columns']
-    values = [data.get('id') if c == 'json_id' else data.get(c) for c in cols]
+    values = []
+    for c in cols:
+        json_key = 'id' if c == 'json_id' else c
+        raw_keys = [k for k in data.keys() if sanitize_name(k) == c]
+        if raw_keys:
+            values.append(data.get(raw_keys[0]))
+        else:
+            values.append(None)
     if parent_id and schema.get('parent_table'):
         values.append(parent_id)
     sql = build_insert_query(table, cols, schema['types'], schema.get('parent_table'))
@@ -136,14 +159,24 @@ def insert_data(conn, data, schema, parent_id=None):
         if field in data:
             insert_data(conn, data[field], child_schema, new_id)
 
-# Hilo BD
+# Hilo BD con control de parada
+
 def db_worker(db_cfg, queue, logger):
     conn = None
-    while True:
-        topic, payload = queue.get()
+    while not stop_event.is_set():
+        try:
+            topic, payload = queue.get(timeout=1)
+        except:
+            continue
         if conn is None or conn.closed:
-            conn = psycopg.connect(**db_cfg)
-            conn.autocommit = False
+            try:
+                conn = psycopg.connect(**db_cfg)
+                conn.autocommit = False
+                logger.info("[DB] Conexión establecida")
+            except Exception as e:
+                logger.error(f"[DB] Error al conectar a PostgreSQL: {e}", exc_info=True)
+                time.sleep(5)
+                continue
         try:
             msg = json.loads(payload)
             if topic not in schema_registry:
@@ -158,31 +191,54 @@ def db_worker(db_cfg, queue, logger):
             logger.info(f"[DB] Insertado mensaje en topic {topic}")
         except Exception as e:
             logger.error(f"[DB] Error: {e}", exc_info=True)
-            if conn and not conn.closed:    # si ocurre una excepción o la conexión a base de datos está cerrada, el código realiza un roollback
-                conn.rollback()
+            if conn and not conn.closed:
+                try:
+                    conn.rollback()
+                except:
+                    pass
+                try:
+                    conn.close()
+                except:
+                    pass
+                conn = None
 
 # MQTT callbacks
+
 def on_connect(client, userdata, flags, rc, props=None):
     if rc == 0:
         userdata['logger'].info("Conectado a MQTT")
+        if not userdata['topics']:
+            userdata['logger'].warning("No se han configurado topics para suscribirse.")
         for topic in userdata['topics']:
             client.subscribe(topic, qos=userdata['qos'])
+    else:
+        userdata['logger'].error(f"Error al conectar a MQTT. Código de retorno: {rc}")
 
 def on_message(client, userdata, msg):
     userdata['queue'].put((msg.topic, msg.payload.decode('utf-8')))
 
 def on_disconnect(client, userdata, rc):
     userdata['logger'].warning("Desconectado de MQTT. Intentando reconectar...")
-    while True:
+    while not stop_event.is_set():
         try:
             client.reconnect()
             break
         except Exception as e:
             userdata['logger'].error(f"Error al reconectar: {e}")
-            time.sleep(5)  # Esperar antes de intentar reconectar
+            time.sleep(5)
+
+# Señal para detener el programa
+
+def signal_handler(sig, frame):
+    print("\n[INFO] Señal de interrupción recibida. Deteniendo hilos...")
+    stop_event.set()
 
 # Main
+
 def main():
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     config = configparser.ConfigParser()
     config.read("config.ini")
 
@@ -207,22 +263,37 @@ def main():
     fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logger.addHandler(fh)
 
-    queue = Queue(maxsize=1000)  # Limitar la cola a 1000 mensajes
+    queue = Queue(maxsize=1000)
     num_threads = config.getint('service', 'threads', fallback=4)
+    threads = []
     for _ in range(num_threads):
-        threading.Thread(target=db_worker, args=(db_cfg, queue, logger), daemon=True).start()
+        t = threading.Thread(target=db_worker, args=(db_cfg, queue, logger), daemon=True)
+        t.start()
+        threads.append(t)
 
     mqtt_cfg = config['mqtt']
-    protocol_version = int(mqtt_cfg.get('version', 3))
-    client = mqtt.Client(protocol=mqtt.MQTTv5 if protocol_version == 5 else mqtt.MQTTv311)
-    client.username_pw_set(mqtt_cfg.get('username'), mqtt_cfg.get('password'))
-    topics = [t.strip() for t in mqtt_cfg['topics'].split(',')]
-    client.user_data_set({'queue': queue, 'logger': logger, 'topics': topics, 'qos': mqtt_cfg.getint('qos', fallback=1)})
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.on_disconnect = on_disconnect
-    client.connect(mqtt_cfg['host'], mqtt_cfg.getint('port'))
-    client.loop_forever()
+    try:
+        protocol_version = int(mqtt_cfg.get('version', 3))
+        client = mqtt.Client(protocol=mqtt.MQTTv5 if protocol_version == 5 else mqtt.MQTTv311)
+        client.username_pw_set(mqtt_cfg.get('username'), mqtt_cfg.get('password'))
+        topics = [t.strip() for t in mqtt_cfg['topics'].split(',') if t.strip()]
+        client.user_data_set({'queue': queue, 'logger': logger, 'topics': topics, 'qos': mqtt_cfg.getint('qos', fallback=1)})
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        client.connect(mqtt_cfg['host'], mqtt_cfg.getint('port'))
+        client.loop_start()
+
+        # Esperar hasta que se reciba señal de parada
+        while not stop_event.is_set():
+            time.sleep(1)
+
+        client.loop_stop()
+        client.disconnect()
+        logger.info("Cliente MQTT desconectado.")
+
+    except Exception as e:
+        logger.error(f"Error al iniciar el cliente MQTT: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
