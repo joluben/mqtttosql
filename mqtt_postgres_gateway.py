@@ -141,7 +141,7 @@ def db_worker(db_cfg, queue, logger):
     conn = None
     while True:
         topic, payload = queue.get()
-        if conn is None:
+        if conn is None or conn.closed:
             conn = psycopg.connect(**db_cfg)
             conn.autocommit = False
         try:
@@ -158,7 +158,7 @@ def db_worker(db_cfg, queue, logger):
             logger.info(f"[DB] Insertado mensaje en topic {topic}")
         except Exception as e:
             logger.error(f"[DB] Error: {e}", exc_info=True)
-            if conn:
+            if conn and not conn.closed:    # si ocurre una excepción o la conexión a base de datos está cerrada, el código realiza un roollback
                 conn.rollback()
 
 # MQTT callbacks
@@ -171,10 +171,25 @@ def on_connect(client, userdata, flags, rc, props=None):
 def on_message(client, userdata, msg):
     userdata['queue'].put((msg.topic, msg.payload.decode('utf-8')))
 
+def on_disconnect(client, userdata, rc):
+    userdata['logger'].warning("Desconectado de MQTT. Intentando reconectar...")
+    while True:
+        try:
+            client.reconnect()
+            break
+        except Exception as e:
+            userdata['logger'].error(f"Error al reconectar: {e}")
+            time.sleep(5)  # Esperar antes de intentar reconectar
+
 # Main
 def main():
     config = configparser.ConfigParser()
     config.read("config.ini")
+
+    required_keys = ['host', 'port', 'database', 'user', 'password']
+    for key in required_keys:
+        if key not in config['postgres']:
+            raise ValueError(f"Falta la clave '{key}' en la sección [postgres] del archivo de configuración.")
 
     db_cfg = {
         'host': config['postgres']['host'],
@@ -192,18 +207,20 @@ def main():
     fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logger.addHandler(fh)
 
-    queue = Queue()
+    queue = Queue(maxsize=1000)  # Limitar la cola a 1000 mensajes
     num_threads = config.getint('service', 'threads', fallback=4)
     for _ in range(num_threads):
         threading.Thread(target=db_worker, args=(db_cfg, queue, logger), daemon=True).start()
 
     mqtt_cfg = config['mqtt']
-    client = mqtt.Client(protocol=mqtt.MQTTv5 if mqtt_cfg.get('version') == '5' else mqtt.MQTTv311)
+    protocol_version = int(mqtt_cfg.get('version', 3))
+    client = mqtt.Client(protocol=mqtt.MQTTv5 if protocol_version == 5 else mqtt.MQTTv311)
     client.username_pw_set(mqtt_cfg.get('username'), mqtt_cfg.get('password'))
     topics = [t.strip() for t in mqtt_cfg['topics'].split(',')]
     client.user_data_set({'queue': queue, 'logger': logger, 'topics': topics, 'qos': mqtt_cfg.getint('qos', fallback=1)})
     client.on_connect = on_connect
     client.on_message = on_message
+    client.on_disconnect = on_disconnect
     client.connect(mqtt_cfg['host'], mqtt_cfg.getint('port'))
     client.loop_forever()
 
