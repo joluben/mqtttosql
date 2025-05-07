@@ -20,6 +20,8 @@ from shapely import wkt
 # Evento de parada global para terminar hilos de forma controlada
 stop_event = threading.Event()
 
+schema_name = 'public'  # Valor por defecto
+
 # Sanitizar nombres para uso en SQL
 
 def sanitize_name(name):
@@ -99,11 +101,11 @@ def build_create_table_sql(schema_node):
     stmts = []
 
     def build(schema):
-        table = schema['table']
+        table = f"{schema_name}.{schema['table']}"
         cols = ["id BIGSERIAL PRIMARY KEY"]
         if schema.get("parent_table"):
             parent_col = f"{schema['parent_table']}_id"
-            cols.append(f"{parent_col} BIGINT REFERENCES {schema['parent_table']}(id)")
+            cols.append(f"{parent_col} BIGINT REFERENCES {schema_name}.{schema['parent_table']}(id)")
         for col in schema['columns']:
             col_type = schema['types'].get(col, "TEXT")
             if col_type == "GEOMETRY":
@@ -132,7 +134,8 @@ def build_insert_query(table, columns, types, parent_table=None):
             placeholders.append("%s")
     if parent_table:
         placeholders.append("%s")
-    sql = f"INSERT INTO {table} ({', '.join(all_cols)}) VALUES ({', '.join(placeholders)}) RETURNING id;"
+    full_table = f"{schema_name}.{table}"
+    sql = f"INSERT INTO {full_table} ({', '.join(all_cols)}) VALUES ({', '.join(placeholders)}) RETURNING id;"
     return sql
 
 def insert_single_row(conn, data, schema, parent_id=None):
@@ -163,6 +166,7 @@ def insert_data(conn, data, schema, parent_id=None):
 
 def db_worker(db_cfg, queue, logger):
     conn = None
+    logger.info("[DB] Hilo iniciado, esperando conexión a PostgreSQL...")
     while not stop_event.is_set():
         try:
             topic, payload = queue.get(timeout=1)
@@ -172,6 +176,7 @@ def db_worker(db_cfg, queue, logger):
             try:
                 conn = psycopg.connect(**db_cfg)
                 conn.autocommit = False
+                conn.execute(f"SET search_path TO {schema_name}")
                 logger.info("[DB] Conexión establecida")
             except Exception as e:
                 logger.error(f"[DB] Error al conectar a PostgreSQL: {e}", exc_info=True)
@@ -202,40 +207,73 @@ def db_worker(db_cfg, queue, logger):
                     pass
                 conn = None
 
-# MQTT callbacks
-
-def on_connect(client, userdata, flags, rc, props=None):
-    if rc == 0:
-        userdata['logger'].info("Conectado a MQTT")
-        if not userdata['topics']:
-            userdata['logger'].warning("No se han configurado topics para suscribirse.")
-        for topic in userdata['topics']:
-            client.subscribe(topic, qos=userdata['qos'])
-    else:
-        userdata['logger'].error(f"Error al conectar a MQTT. Código de retorno: {rc}")
-
-def on_message(client, userdata, msg):
-    userdata['queue'].put((msg.topic, msg.payload.decode('utf-8')))
-
-def on_disconnect(client, userdata, rc):
-    userdata['logger'].warning("Desconectado de MQTT. Intentando reconectar...")
-    while not stop_event.is_set():
-        try:
-            client.reconnect()
-            break
-        except Exception as e:
-            userdata['logger'].error(f"Error al reconectar: {e}")
-            time.sleep(5)
-
 # Señal para detener el programa
 
 def signal_handler(sig, frame):
-    print("\n[INFO] Señal de interrupción recibida. Deteniendo hilos...")
+    print("[INFO] Señal de interrupción recibida. Deteniendo hilos...")
     stop_event.set()
 
-# Main
+# Definir la función on_connect
+
+def on_connect(client, userdata, flags, rc):
+    """
+    Callback que se ejecuta cuando el cliente MQTT se conecta al broker.
+
+    Args:
+        client: Instancia del cliente MQTT.
+        userdata: Datos definidos por el usuario.
+        flags: Bandera de conexión.
+        rc: Código de resultado de la conexión.
+    """
+    logger = userdata['logger']
+    if rc == 0:
+        logger.info("Conexión exitosa al broker MQTT.")
+        for topic in userdata['topics']:
+            client.subscribe(topic, userdata['qos'])
+            logger.info(f"Suscrito al topic: {topic}")
+    else:
+        logger.error(f"Error al conectar al broker MQTT. Código de error: {rc}")
+
+# Definir la función on_message
+
+def on_message(client, userdata, msg):
+    """
+    Callback que se ejecuta cuando se recibe un mensaje en un topic suscrito.
+
+    Args:
+        client: Instancia del cliente MQTT.
+        userdata: Datos definidos por el usuario.
+        msg: Mensaje recibido, incluye topic, payload, etc.
+    """
+    logger = userdata['logger']
+    queue = userdata['queue']
+    try:
+        logger.info(f"Mensaje recibido en topic {msg.topic}: {msg.payload}")
+        queue.put((msg.topic, msg.payload.decode('utf-8')))
+    except Exception as e:
+        logger.error(f"Error al procesar el mensaje: {e}", exc_info=True)
+
+# Definir la función on_disconnect
+
+def on_disconnect(client, userdata, rc):
+    """
+    Callback que se ejecuta cuando el cliente MQTT se desconecta del broker.
+
+    Args:
+        client: Instancia del cliente MQTT.
+        userdata: Datos definidos por el usuario.
+        rc: Código de resultado de la desconexión.
+    """
+    logger = userdata['logger']
+    if rc != 0:
+        logger.warning("Desconexión inesperada del broker MQTT.")
+    else:
+        logger.info("Desconexión exitosa del broker MQTT.")
+
+# MQTT callbacks y main no cambian salvo la asignación de schema_name
 
 def main():
+    global schema_name
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -246,6 +284,8 @@ def main():
     for key in required_keys:
         if key not in config['postgres']:
             raise ValueError(f"Falta la clave '{key}' en la sección [postgres] del archivo de configuración.")
+
+    schema_name = config['postgres'].get('schema', 'public')
 
     db_cfg = {
         'host': config['postgres']['host'],
@@ -274,7 +314,10 @@ def main():
     mqtt_cfg = config['mqtt']
     try:
         protocol_version = int(mqtt_cfg.get('version', 3))
-        client = mqtt.Client(protocol=mqtt.MQTTv5 if protocol_version == 5 else mqtt.MQTTv311)
+        client = mqtt.Client(
+            client_id=mqtt_cfg.get('client_id', ''),
+            protocol=mqtt.MQTTv5 if protocol_version == 5 else mqtt.MQTTv311
+        )
         client.username_pw_set(mqtt_cfg.get('username'), mqtt_cfg.get('password'))
         topics = [t.strip() for t in mqtt_cfg['topics'].split(',') if t.strip()]
         client.user_data_set({'queue': queue, 'logger': logger, 'topics': topics, 'qos': mqtt_cfg.getint('qos', fallback=1)})

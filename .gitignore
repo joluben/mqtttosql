@@ -1,1 +1,47 @@
-git rm --cached configdev.ini
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Entornos virtuales y dependencias
+env/
+venv/
+node_modules/
+
+# Archivos temporales y logs
+*.log
+*.tmp
+*.swp
+*.bak
+
+# Archivos de compilación
+dist/
+build/
+out/
+*.class
+*.exe
+*.dll
+*.so
+*.pyc
+__pycache__/
+
+# Configuración de IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# Archivos sensibles o locales
+*.env
+.env.*
+*.secret
+*.key
+
+# Archivos de bases de datos locales
+*.sqlite
+*.db
+*.bak
+
+# Archivos generados
+*.pdf
+*.docx
+*.zip
+*.tar.gz
