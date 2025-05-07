@@ -1,46 +1,45 @@
-# Archivos del sistema
-.DS_Store
-Thumbs.db
+# Archivos compilados de Python
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Entornos virtuales y dependencias
+# Entorno virtual
 env/
 venv/
-node_modules/
+ENV/
+.venv/
 
-# Archivos temporales y logs
+# Archivos de configuración/locales
+*.env
+.env.*
+*.ini
+*.cfg
+*.egg-info/
 *.log
-*.tmp
-*.swp
-*.bak
 
-# Archivos de compilación
-dist/
-build/
-out/
-*.class
-*.exe
-*.dll
-*.so
-*.pyc
-__pycache__/
+# Archivos de pruebas
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
 
-# Configuración de IDEs
+# Configuraciones de IDEs/editores
 .vscode/
 .idea/
 *.code-workspace
 
-# Archivos sensibles o locales
-*.env
-.env.*
-*.secret
-*.key
-
-# Archivos de bases de datos locales
-*.sqlite
+# Archivos de bases de datos y serialización
 *.db
+*.sqlite
 *.bak
+*.json
 
-# Archivos generados
+# Archivos temporales del sistema
+.DS_Store
+Thumbs.db
+
+# Documentos generados
 *.pdf
 *.docx
 *.zip
